@@ -34,7 +34,11 @@ under Proton: both are given the same inputs and screenshots are taken at the sa
   the build gives guest memory accesses x86's ordering (`RT_TSO` in `recomp/runtime/rt.h`; the thread's own stack is
   left plain, so it costs little), and every `lock`-prefixed instruction is a real hardware atomic.
 - **The launch window** shows the game's title and loading-screen art (read from your own archives at install time)
-  and sets the resolution, the notch, the frame rate and updates.
+  and sets the resolution, the notch, the frame rate, antialiasing and updates.
+- **Antialiasing**: the launch window's Off / 2x / 4x MSAA (4x by default, as the original's 4 Samples;
+  `DSR_MSAA=2|4` outside it; Apple GPUs take at most 4 samples, so 8 gives 4). The renderer multisamples the screen's render targets, depth buffer and HDR scene,
+  as a driver override does; the game's own MSAA path stays off, so the water keeps its reflections, as the original
+  shows them with antialiasing off. 4x costs about 1.4 ms of GPU time a frame at 2560×1440 (M1 Pro).
 
 Install (Apple Silicon, the Xcode command line tools and python3):
 

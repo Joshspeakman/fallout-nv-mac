@@ -48,7 +48,7 @@ fi
 echo "== compiling"
 rm -rf "$OUT/obj"; mkdir -p "$OUT/obj"
 JOBS="${DS_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
-printf '%s\n' "$OUT"/lift_*.c "$OUT"/*_lift_*.c "$OUT/fntab.c" | xargs -n 1 -P "$JOBS" "$HERE/tools/cc1.sh" "$OUT"
+printf '%s\0' "$OUT"/lift_*.c "$OUT"/*_lift_*.c "$OUT/fntab.c" | xargs -0 -n 1 -P "$JOBS" "$HERE/tools/cc1.sh" "$OUT"
 rm -f "$OUT/obj/rt.o"
 "$HERE/tools/build_runtime.sh" "$OUT"            # runtime + Win32 layer, then the link
 if [[ $(uname -s) == Linux ]]; then echo "== $OUT/libgame.so"; else echo "== $OUT/libgame.dylib"; fi

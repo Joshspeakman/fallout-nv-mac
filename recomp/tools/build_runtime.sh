@@ -3,6 +3,16 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"; OUT="$1"; mkdir -p "$OUT/obj/rt"
 if [[ $(uname -s) == Linux ]]; then exec "$HERE/tools/build_linux.sh" "$OUT"; fi
+# Check every compiler status before linking; bound parallel work on macOS.
+PIDS=(); JOBS="${NATIVE_BUILD_JOBS:-6}"
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "invalid NATIVE_BUILD_JOBS" >&2; exit 1; }
+wait_jobs() {
+  local failed=0 pid
+  for pid in "${PIDS[@]:-}"; do [ -z "$pid" ] || wait "$pid" || failed=1; done
+  PIDS=(); [ "$failed" -eq 0 ]
+}
+queue_job() { PIDS+=("$!"); if [ "${#PIDS[@]}" -ge "$JOBS" ]; then wait_jobs; fi; }
+trap 'for pid in "${PIDS[@]:-}"; do [ -z "$pid" ] || wait "$pid" || true; done' EXIT
 python3 "$HERE/tools/gen_imptab.py" "$OUT/imptab.c" "$HERE"/runtime/win32/*.c
 # the edition (Fallout: New Vegas, or Dungeon Siege II and Broken World) by the executable in the build folder
 EXE="$OUT/DungeonSiege2.exe"; [[ -f "$OUT/FalloutNV.exe" ]] && EXE="$OUT/FalloutNV.exe"
@@ -21,10 +31,12 @@ MOJO=(-DSUPPORT_PROFILE_D3D=0 -DSUPPORT_PROFILE_BYTECODE=0 -DSUPPORT_PROFILE_HLS
 mkdir -p "$OUT/obj/rt/mojo"
 for f in "$HERE"/third_party/mojoshader/mojoshader.c "$HERE"/third_party/mojoshader/mojoshader_common.c "$HERE"/third_party/mojoshader/profiles/*.c; do
   clang -c -O2 -w "${MOJO[@]}" -o "$OUT/obj/rt/mojo/$(basename "$f" .c).o" "$f" &
+  queue_job
 done
 for f in "$HERE"/runtime/rt.c "$HERE"/runtime/win32/*.c "$OUT/imptab.c"; do
   opt=-O1; [ "$(basename "$f")" = native.c ] && opt=-O3   # the native hot loops: optimised
   clang -c $opt -g -ffp-contract=off -fno-strict-aliasing -Wall -Wno-unused-function ${EDITION_FLAGS[@]+"${EDITION_FLAGS[@]}"} -I "$HERE/runtime" -I "$HERE/runtime/win32" \
     -I "$HERE/third_party/mojoshader" -I "$HERE/third_party/minimp3" -o "$OUT/obj/rt/$(basename "$f" .c).o" "$f" &
-done; wait
+  queue_job
+done; wait_jobs
 clang -shared -o "$OUT/libgame.dylib" "$OUT"/obj/*.o "$OUT"/obj/rt/*.o "$OUT"/obj/rt/mojo/*.o -framework CoreText -framework CoreGraphics -framework CoreFoundation -framework AudioToolbox -lz

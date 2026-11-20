@@ -179,7 +179,11 @@ static void draw_text(NSString *s, NSFont *f, NSColor *c, NSRect r, NSTextAlignm
 - (void)drawTitle:(NSRect)r
 {
     /* "DUNGEON SIEGE" in the logo's manner: brushed silver letters, a copper rim, a dark drop shadow */
+#ifdef FNV_EDITION
+    NSString *t = @"FALLOUT: NEW VEGAS"; NSFont *f = cp(36, YES);   /* (only without the art install.sh decodes) */
+#else
     NSString *t = @"DUNGEON SIEGE II"; NSFont *f = cp(42, YES);
+#endif
     NSDictionary *at = @{NSFontAttributeName: f, NSKernAttributeName: @3};
     NSSize sz = [t sizeWithAttributes:at]; NSPoint o = NSMakePoint(NSMidX(r) - sz.width / 2, NSMidY(r) - sz.height / 2 - 2);
     NSShadow *sh = [NSShadow new]; sh.shadowColor = [NSColor colorWithWhite:0 alpha:0.85]; sh.shadowOffset = NSMakeSize(0, -3); sh.shadowBlurRadius = 5;
@@ -285,6 +289,15 @@ static NSArray<NSDictionary *> *notch_choices(void)
              @{@"value": @"around", @"label": @"Around the Notch", @"note": @"The picture on the whole display, the notch over its top"}];
 }
 static void apply_notch(NSString *v) { setenv("DS_NOTCH", v.UTF8String, 1); }
+/* Fallout: New Vegas: the renderer's multisampling (DSR_MSAA), as the original launcher's Antialiasing setting; the
+ * game's own MSAA path isn't used (renderer.m) */
+static NSArray<NSDictionary *> *aa_choices(void)
+{
+    return @[@{@"value": @"off", @"label": @"Off", @"note": @"No antialiasing"},
+             @{@"value": @"2", @"label": @"2x MSAA", @"note": @"Smoother edges"},
+             @{@"value": @"4", @"label": @"4x MSAA", @"note": @"As the original game's 4 Samples"}];   /* (Apple GPUs take at most 4) */
+}
+static void apply_aa(NSString *v) { if ([v isEqualToString:@"off"]) unsetenv("DSR_MSAA"); else setenv("DSR_MSAA", v.UTF8String, 1); }
 /* Interface Size: the game runs at the chosen resolution divided by this, so its interface is laid out that much
  * larger, and the renderer draws the screen at the chosen resolution itself (DSR_RENDER_SCALE), so the world stays sharp.
  * Only sizes that leave the game at least 800x600 (what its interface is laid out for) are offered. */
@@ -450,7 +463,9 @@ static NSString *update_check(NSString *updater)   /* the newest commit of the b
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{ if (t.running) [t terminate]; });
     NSData *d = [p.fileHandleForReading readDataToEndOfFile]; [t waitUntilExit];
     NSString *out = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    return t.terminationStatus == 0 && out.length >= 40 ? [out substringToIndex:40] : nil;
+    if (t.terminationStatus != 0 || !out.length) return nil;
+    if (out.length >= 40) return [out substringToIndex:40];   /* a commit (an app built from source) */
+    return [out rangeOfCharacterFromSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].location == NSNotFound ? out : nil;   /* a release's tag (the downloaded app) */
 }
 static NSArray<NSDictionary *> *update_choice(int state, NSString *branch, NSString *built, NSString *latest)
 {
@@ -466,6 +481,12 @@ static NSArray<NSDictionary *> *update_choice(int state, NSString *branch, NSStr
 /* the phase of install.sh's output, in words */
 static NSString *update_phase(NSString *line, NSString *branch)
 {
+    if ([branch isEqualToString:@"release"]) {   /* the downloaded app's updater (setup/update.sh) */
+        if ([line hasPrefix:@"== downloading "]) return [NSString stringWithFormat:@"Downloading %@ from GitHub", [line substringFromIndex:15]];
+        if ([line hasPrefix:@"== unpacking"]) return @"Unpacking it";
+        if ([line hasPrefix:@"== installing"]) return @"Installing the new app";
+        return nil;
+    }
     if ([line hasPrefix:@"== fetching"]) return @"Downloading the update from GitHub";
     if ([line hasPrefix:[NSString stringWithFormat:@"== %@:", branch]]) return [@"Got " stringByAppendingString:[line substringFromIndex:branch.length + 4]];
     if ([line hasPrefix:@"== analysis"]) return @"Rebuilding from your game: analysing its code (1 of 4)";
@@ -545,9 +566,13 @@ int ds_launcher_run(const char *game_dir, const char *data_dir)
     DSRow *ui = [DSRow new]; ui.title = @"Interface Size"; ui.choices = ui_choices(res.choices[res.index][@"value"]); ui.index = index_of(ui.choices, saved[@"interfaceSize"], 0);
     dist.title = @"View Distance"; dist.choices = distance_choices(); dist.index = index_of(dist.choices, saved[@"viewDistance"], 0);
     fps.title = @"Frame Rate"; fps.choices = framerate_choices(); fps.index = index_of(fps.choices, saved[@"frameRate"], 0);
+    DSRow *aa = [DSRow new]; aa.title = @"Antialiasing"; aa.choices = aa_choices(); aa.index = index_of(aa.choices, saved[@"antialiasing"], 2);   /* 4x by default: the original's own 4 Samples; about 1.4 ms of GPU time at 2560x1440 on an M1 Pro */
     const char *shot = getenv("DS_LAUNCHER_SHOT");
     if (getenv("DS_NO_LAUNCHER") && !shot) {
         if (saved.count) { apply(res.choices[res.index][@"value"], dist.choices[dist.index][@"value"], fps.choices[fps.index][@"value"]); apply_notch(notch.choices[notch.index][@"value"]);
+#ifdef FNV_EDITION
+                         apply_aa(aa.choices[aa.index][@"value"]);
+#endif
                          apply_ui(res.choices[res.index][@"value"], ui.choices[ui.index][@"value"]); }
         return 1;
     }
@@ -563,7 +588,7 @@ int ds_launcher_run(const char *game_dir, const char *data_dir)
     __weak DSRow *wo = online;
     online.activate = ^{ if (cdkey_panel(data)) wo.choices = cdkey_choice(data); };
 #ifdef FNV_EDITION
-    NSArray<DSRow *> *rows = notch_height() > 0 ? @[res, notch, fps, upd] : @[res, fps, upd];   /* (no view distance, interface size, CD key or Test Lab) */
+    NSArray<DSRow *> *rows = notch_height() > 0 ? @[res, notch, fps, aa, upd] : @[res, fps, aa, upd];   /* (no view distance, interface size, CD key or Test Lab) */
     (void)wo;
 #else
     NSArray<DSRow *> *rows = notch_height() > 0 ? @[res, ui, notch, dist, fps, online, upd] : @[res, ui, dist, fps, online, upd];
@@ -599,7 +624,7 @@ int ds_launcher_run(const char *game_dir, const char *data_dir)
         if (ustate != UPD_AVAILABLE) { check(); return; }
         NSAlert *a = [NSAlert new];
         a.messageText = [NSString stringWithFormat:@"Update to the newest %@?", [branch isEqualToString:@"nightly"] ? @"Nightly" : @"version"];
-        a.informativeText = [NSString stringWithFormat:@"The %@ branch (%@) is downloaded from GitHub and the app is rebuilt from your own copy of the game, "
+        a.informativeText = [branch isEqualToString:@"release"] ? [NSString stringWithFormat:@"%@ is downloaded from GitHub and replaces this app. Your game, saves and settings are kept; if the game's code changed, it is rebuilt from your copy when the app starts again.", latest] : [NSString stringWithFormat:@"The %@ branch (%@) is downloaded from GitHub and the app is rebuilt from your own copy of the game, "
                              "which takes a few minutes. Your game folder, saves and settings are kept. The app restarts when it is done.", branch, short_commit(latest)];
         [a addButtonWithTitle:@"Update"]; [a addButtonWithTitle:@"Cancel"];
         if ([a runModal] != NSAlertFirstButtonReturn) return;
@@ -677,7 +702,11 @@ int ds_launcher_run(const char *game_dir, const char *data_dir)
     NSString *rv = res.choices[res.index][@"value"], *fv = fps.choices[fps.index][@"value"];
     NSString *dv = dist.choices[dist.index][@"value"];
     NSString *nv = notch.choices[notch.index][@"value"], *uv = ui.choices[ui.index][@"value"];
-    [@{@"resolution": rv, @"viewDistance": dv, @"frameRate": fv, @"notch": nv, @"interfaceSize": uv} writeToFile:plistPath atomically:YES];
+    NSString *av = aa.choices[aa.index][@"value"];
+    [@{@"resolution": rv, @"viewDistance": dv, @"frameRate": fv, @"notch": nv, @"interfaceSize": uv, @"antialiasing": av} writeToFile:plistPath atomically:YES];
     apply(rv, dv, fv); apply_notch(nv); apply_ui(rv, uv);
+#ifdef FNV_EDITION
+    apply_aa(av);
+#endif
     return result;
 }

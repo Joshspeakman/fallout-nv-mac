@@ -1,0 +1,78 @@
+{
+  "name": "Fallout New Vegas",
+  "folder": "Fallout New Vegas",
+  "bundle_id": "io.github.joshspeakman.fallout-nv",
+  "release_repo": "Joshspeakman/fallout-nv-macos",
+  "binary": "Fallout New Vegas",
+  "icon_label": "FNV",
+  "version": "1.4.0.525",
+  "where": "Your Fallout: New Vegas folder (GOG's Ultimate Edition, 1.4.0.525)",
+  "minutes": 12,
+  "space_gb": 14,
+  "build_gb": 4,
+  "exe": "FalloutNV.exe",
+  "exe_sha256": {
+    "89e7020487e80f20ddc92ea641c4433b2c6839a82f45a076e414d167d11dd0fe": "GOG 1.4.0.525"
+  },
+  "required": [
+    "Data/FalloutNV.esm",
+    "Data/Fallout - Meshes.bsa",
+    "Data/Fallout - Misc.bsa",
+    "Data/Fallout - Sound.bsa",
+    "Data/Fallout - Textures.bsa",
+    "Data/Fallout - Textures2.bsa",
+    "Data/Fallout - Voices1.bsa",
+    "binkw32.dll",
+    "libvorbis.dll",
+    "libvorbisfile.dll"
+  ],
+  "libs": [
+    {
+      "file": "binkw32.dll"
+    },
+    {
+      "file": "libvorbis.dll"
+    },
+    {
+      "file": "libvorbisfile.dll",
+      "rebase": "0x11000000"
+    }
+  ],
+  "tag_lowercase": true,
+  "lift_args": [
+    "--game",
+    "fnv"
+  ],
+  "cc_args": [
+    "-fPIC",
+    "-DRT_TSO",
+    "-DRT_HOST_RC_INIT=UINT32_MAX"
+  ],
+  "art": "fnv_art.py",
+  "log": "FalloutNVNative",
+  "local_network": "Fallout: New Vegas doesn't use your local network.",
+  "build": "./build_fnv.sh \"$GAME/FalloutNV.exe\" && ./tools/build_app.sh \"$PWD/work/fnv\"",
+  "out": "work/fnv",
+  "rt_opt": "-O1 -ffp-contract=off",
+  "rt_cflags": [
+    "-DFNV_EDITION",
+    "-DRT_TSO"
+  ],
+  "host_cflags": [
+    "-DFNV_EDITION",
+    "-DRT_TSO"
+  ],
+  "frameworks": [
+    "AppKit",
+    "Metal",
+    "QuartzCore",
+    "CoreText",
+    "CoreGraphics",
+    "CoreFoundation",
+    "AudioToolbox",
+    "CoreImage"
+  ],
+  "style": "iron",
+  "title": "FALLOUT: NEW VEGAS",
+  "art_url": "https://images-1.gog-statics.com/bbe476d5a545ad5b6f4504795c7b6508d3b585b8c068df53372877c0c26c9b90.jpg"
+}

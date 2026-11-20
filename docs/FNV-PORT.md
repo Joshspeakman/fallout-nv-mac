@@ -173,8 +173,8 @@ at 120 Hz. Scheduler noise affects lateness; this does not establish tighter lat
 
 The original visual reference is documented in [issue #1](https://github.com/Joshspeakman/fallout-nv-macos/issues/1):
 original GOG 1.4.0.525 through UMU-Proton 10.0-4 on Prime, rather than native Windows. Matching Mac captures use the
-same save, 1280×720 and the supplied INIs. All 11 supplied ESM/ESP hashes match. The reference uses 4× MSAA, while
-the current Metal renderer has no multisample attachments; edge aliasing is a known remaining difference. Anisotropic
+same save, 1280×720 and the supplied INIs. All 11 supplied ESM/ESP hashes match. The reference uses 4× MSAA; the
+Metal renderer now has it too (`DSR_MSAA`, the launch window's Antialiasing row, 4x by default: see below). Anisotropic
 filtering improves the road detail toward the reference. Dynamic weather/exposure, particles and NPC movement limit
 pixel comparisons. The idle vanity camera must be cancelled before taking a matching first-person view.
 
@@ -186,7 +186,19 @@ nightly and this audit build. Its verified archive SHA256 is
 `66666577dabaddc416ad7c178a0c23df1e5ef0207c42827f82df28c59b21569c`; Prime kept the same INI water flags and loaded
 weather. The matched still supports retaining the current water semantics. Runtime weather ID and reflection
 booleans could not be queried, so this is not proof of deterministic parity. The Strip sky and the Metal backend's
-missing MSAA attachments remain open; the original 4× reference is retained separately.
+MSAA (2026-11-18): `DSR_MSAA=2|4` (8 falls back to the most the GPU takes: 4 on Apple GPUs) multisamples the screen-sized render targets, depth buffers and float render-target
+textures; each pass resolves as it ends (depth and stencil: sample 0) and every pipeline is made per sample count.
+Checked at 1280×720: Goodsprings noon power poles and wires antialiased; Pip-Boy, HUD, the Strip at night and the
+Hoover Dam water draw as before, and with no Metal validation errors. The game's own MSAA path stays off, so the dam
+water matches the original's antialiasing-off control (`78-water-msaa0.png`: strong cloud reflections), not the 4×
+reference's flat water. Uncapped Goodsprings: about 86 fps either way (the CPU is the limit); GPU time 4.3 → 4.6 ms at
+1280×720, 5.7 → 7.2 ms at 2560×1440 with 4x.
+
+The Strip sky stays different: at 21:00 the Mac's is navy, the reference's lilac. The Strip has one weather
+(`NVTheStripWeather`, 100%) and its climate's sunset ends at 20:00, so night colours at 21:00 are what the data asks
+for; the Mac's sky at 20:00 is close to the reference's. Replaying the reference's own order (the hour set in the
+Saloon, the Strip ~90 s later, first person; the hour's echo checked) gives navy again. Settling it needs an original
+capture with the hour set outdoors (an issue of its own); the original 4× reference is retained separately.
 
 A 13-minute copied-profile tour exited normally and exported 44,072 valid completed frame records. Selected settled
 windows had median frame intervals near 16.7 ms in the Saloon and at the dam, and 17.0 ms at dusk. The Strip window

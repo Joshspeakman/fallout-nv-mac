@@ -13,7 +13,7 @@ volatile int dsr_flash_frame; int dsr_verbose; long dsr_stat[8]; double dsr_gpu_
  * runs at a smaller resolution, so its interface is laid out larger, and its screen-sized surfaces are drawn that much
  * larger, at the display's own resolution). Positions stay in the game's units everywhere; they become texture pixels
  * only where Metal is given a viewport, an upload or a copy. */
-typedef struct { id<MTLTexture> tex, view2d, sview; uint32_t w, h, kind, fmt, level, root, slice; int used, fxrt; float sc; } Surf;   /* sview: float formats as sampled (missing channels 1, as D3D9) */   /* fxrt: an effect pass drew into it (DSR_GLOWLOG) */   /* cube faces: tex the cube, view2d the face as 2D */
+typedef struct { id<MTLTexture> tex, view2d, sview, ms; uint32_t w, h, kind, fmt, level, root, slice, samples; int used, fxrt, ms_stale; float sc; } Surf;   /* ms: multisampled storage (DSR_MSAA) drawn into; each pass resolves it into tex, which everything else reads */   /* sview: float formats as sampled (missing channels 1, as D3D9) */   /* fxrt: an effect pass drew into it (DSR_GLOWLOG) */   /* cube faces: tex the cube, view2d the face as 2D */
 static inline id<MTLTexture> tex2d(const void *sp) { const Surf *s = sp; return s->view2d ? s->view2d : s->tex; }
 typedef struct {   // must match shaders.metal Uniforms
     float wvp[16], wv[16], tex0[16];
@@ -228,16 +228,76 @@ static Surf *depth_with(DSRRenderer *r, Surf *c, Surf *z)
     NSUInteger cw = MAX(c->tex.width >> c->level, 1u), ch = MAX(c->tex.height >> c->level, 1u);
     return z->tex.width < cw || z->tex.height < ch ? NULL : z;
 }
+/* DSR_MSAA (2/4/8): multisampling on the game's screen-sized render targets, depth buffers and floating-point render
+ * target textures (the HDR scene), as a driver override does; the game's own MSAA path draws its scene without a depth
+ * buffer here (d3d9.c's CheckDeviceMultiSampleType). A pass draws into the multisampled storage when its target and
+ * depth buffer agree on it (as Direct3D requires) and resolves into the texture as it ends (depth and stencil: sample
+ * 0), so sampling, copies, read-backs and presenting see the plain texture as before. */
+static uint32_t pass_samples(Surf *c, Surf *z)          /* z: depth_with()'s */
+{
+    if (!c || !c->ms || c->level || c->slice) return 1;
+    if (z && (!z->ms || z->samples != c->samples)) return 1;
+    return c->samples;
+}
+static uint32_t cur_samples(DSRRenderer *r) { Surf *c = surf(r, r->rt); return pass_samples(c, depth_with(r, c, surf(r, r->ds))); }
+static id<MTLRenderPipelineState> helper_pso(DSRRenderer *r, int kind, MTLPixelFormat pf, uint32_t samples);
+static uint32_t forced_samples(DSRRenderer *r, const Surf *s, uint32_t levels)
+{
+    static int n = -1; if (n < 0) { const char *e = getenv("DSR_MSAA"); n = e ? atoi(e) : 0; if (n != 2 && n != 4 && n != 8) n = 0; }
+    if (!n || !r->mode_w || s->w != r->mode_w || s->h != r->mode_h || levels != 1) return 0;
+    return s->kind == 1 || s->kind == 2 || (s->kind == 3 && s->fmt >= 4 && s->fmt <= 9) ? (uint32_t)n : 0;
+}
+static void make_ms(DSRRenderer *r, Surf *s, uint32_t n)
+{
+    uint32_t asked = n;
+    while (n > 1 && ![r->dev supportsTextureSampleCount:n]) n >>= 1;
+    if (n < 2 || !s->tex) return;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->tex.pixelFormat width:s->tex.width height:s->tex.height mipmapped:NO];
+    d.textureType = MTLTextureType2DMultisample; d.sampleCount = n; d.usage = MTLTextureUsageRenderTarget; d.storageMode = MTLStorageModePrivate;
+    s->ms = [r->dev newTextureWithDescriptor:d]; s->samples = s->ms ? n : 0; s->ms_stale = 0;
+    static int said; if (s->ms && !said++) fprintf(stderr, "dsr: MSAA %ux on the screen's render targets and depth buffers%s\n", n, n < asked ? " (the most this GPU takes)" : "");
+}
+/* the texture's pixels into the samples, after something wrote the texture directly (an upload, or a pass whose
+ * target and depth buffer disagreed on multisampling) */
+static void ms_refill(DSRRenderer *r, Surf *s)
+{
+    s->ms_stale = 0;
+    if (s->fmt == 3) return;                             /* depth: not refilled (the game doesn't write it outside passes) */
+    id<MTLRenderPipelineState> qp = helper_pso(r, 0, s->tex.pixelFormat, s->samples); if (!qp) return;
+    end_enc(r);
+    MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+    p.colorAttachments[0].texture = s->ms; p.colorAttachments[0].loadAction = MTLLoadActionDontCare; p.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cmdbuf(r) renderCommandEncoderWithDescriptor:p]; r->encoders++;
+    struct { float dst[4], src[4], color[4]; int32_t mode[4]; } q = {{0, 0, 1, 1}, {0, 0, 1, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}};
+    [e setRenderPipelineState:qp]; [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, s->ms.width, s->ms.height, 0, 1}];
+    [e setVertexBytes:&q length:sizeof q atIndex:0]; [e setFragmentBytes:&q length:sizeof q atIndex:0];
+    [e setFragmentTexture:s->tex atIndex:0]; [e setFragmentSamplerState:r->point_clamp atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4]; [e endEncoding];
+}
 static id<MTLRenderCommandEncoder> enc_for(DSRRenderer *r, uint32_t rt, uint32_t ds)
 {
     if (r->enc && r->enc_rt == rt && r->enc_ds == ds) return r->enc;
     end_enc(r); maybe_commit(r);
     Surf *c = surf(r, rt), *z = surf(r, ds); if (!c) return nil;
     z = depth_with(r, c, z);
+    uint32_t ns = pass_samples(c, z);
+    if (ns > 1 && c->ms_stale) ms_refill(r, c);
+    if (ns == 1) { if (c->ms) c->ms_stale = 1; if (z && z->ms) z->ms_stale = 1; }   /* this pass writes the textures */
     MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
-    p.colorAttachments[0].texture = c->tex; p.colorAttachments[0].loadAction = MTLLoadActionLoad; p.colorAttachments[0].storeAction = MTLStoreActionStore;
-    p.colorAttachments[0].slice = c->slice; p.colorAttachments[0].level = c->level;
-    if (z) { p.depthAttachment.texture = z->tex; p.depthAttachment.loadAction = MTLLoadActionLoad; p.depthAttachment.storeAction = MTLStoreActionStore;
+    if (ns > 1) {
+        p.colorAttachments[0].texture = c->ms; p.colorAttachments[0].resolveTexture = c->tex;
+        p.colorAttachments[0].loadAction = MTLLoadActionLoad; p.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+    } else {
+        p.colorAttachments[0].texture = c->tex; p.colorAttachments[0].loadAction = MTLLoadActionLoad; p.colorAttachments[0].storeAction = MTLStoreActionStore;
+        p.colorAttachments[0].slice = c->slice; p.colorAttachments[0].level = c->level;
+    }
+    if (z && ns > 1) {
+        p.depthAttachment.texture = z->ms; p.depthAttachment.resolveTexture = z->tex; p.depthAttachment.loadAction = MTLLoadActionLoad;
+        p.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve; p.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
+        p.stencilAttachment.texture = z->ms; p.stencilAttachment.resolveTexture = z->tex; p.stencilAttachment.loadAction = MTLLoadActionLoad;
+        p.stencilAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve; p.stencilAttachment.stencilResolveFilter = MTLMultisampleStencilResolveFilterSample0;
+    } else if (z) { p.depthAttachment.texture = z->tex; p.depthAttachment.loadAction = MTLLoadActionLoad; p.depthAttachment.storeAction = MTLStoreActionStore;
              p.stencilAttachment.texture = z->tex; p.stencilAttachment.loadAction = MTLLoadActionLoad; p.stencilAttachment.storeAction = MTLStoreActionStore; }
     if (r->vis) p.visibilityResultBuffer = r->vis;
     r->enc = [cmdbuf(r) renderCommandEncoderWithDescriptor:p]; r->enc_rt = rt; r->enc_ds = z ? ds : 0; r->encoders++;
@@ -253,7 +313,7 @@ static void surface_create(DSRRenderer *r, const uint32_t *p, uint32_t size)
     uint32_t id = p[0], w = p[1], h = p[2], kind = p[3], fmt = p[4], parent = p[5], level = p[6];
     uint32_t face = size >= 40 ? p[8] : 0, cube = size >= 40 && (p[9] & 1);
     if (id >= MAXSURF) return;
-    Surf *s = &r->s[id]; s->tex = s->view2d = s->sview = nil; s->used = 1; s->fxrt = 0; s->w = w; s->h = h; s->kind = kind; s->fmt = fmt; s->level = level; s->root = id; s->slice = face; s->sc = 1;
+    Surf *s = &r->s[id]; s->tex = s->view2d = s->sview = s->ms = nil; s->samples = 0; s->ms_stale = 0; s->used = 1; s->fxrt = 0; s->w = w; s->h = h; s->kind = kind; s->fmt = fmt; s->level = level; s->root = id; s->slice = face; s->sc = 1;
     /* the screen's surfaces (the back buffer, depth buffers and textures the size of the screen, which the game draws into
      * with the screen's depth buffer) are drawn larger with an interface size */
     float sc = r->scale > 1 && !parent && !cube && w == r->mode_w && h == r->mode_h && !(kind == 3 && size >= 32 && p[7] > 1) ? r->scale : 1;
@@ -276,11 +336,13 @@ static void surface_create(DSRRenderer *r, const uint32_t *p, uint32_t size)
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:surf_pf(fmt == 3 ? 1 : fmt) width:pw height:ph mipmapped:levels > 1];
         d.mipmapLevelCount = levels; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView; d.storageMode = MTLStorageModePrivate;   // XRGB: alpha forced to 1 in the shader (swizzles can't be render targets)
         s->tex = [r->dev newTextureWithDescriptor:d]; s->sc = sc; float_view(s);
+        uint32_t want = forced_samples(r, s, levels); if (want) make_ms(r, s, want);
     } else {
         MTLPixelFormat pf = surf_pf(fmt);                    // depth buffers carry an 8-bit stencil; render targets may be floating point
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:pw height:ph mipmapped:NO];
         d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView; d.storageMode = MTLStorageModePrivate;   // XRGB targets: alpha is never read back as destination alpha
         s->tex = [r->dev newTextureWithDescriptor:d]; s->sc = sc; float_view(s);
+        uint32_t want = forced_samples(r, s, 1); if (want) make_ms(r, s, want);
     }
 }
 static void quad(DSRRenderer *r, uint32_t dst, const int32_t *drect, uint32_t src, const int32_t *srect, int fill, uint32_t color);
@@ -315,6 +377,7 @@ static void surface_upload(DSRRenderer *r, const uint32_t *p, uint32_t size)
     void *dst = ring_alloc(r, pitch * h, &off); memcpy(dst, p + 6, pitch * h);
     [blit_enc(r) copyFromBuffer:r->ring sourceOffset:off sourceBytesPerRow:pitch sourceBytesPerImage:pitch * h sourceSize:MTLSizeMake(w, h, 1)
             toTexture:s->tex destinationSlice:s->slice destinationLevel:s->level destinationOrigin:MTLOriginMake(x, y, 0)];
+    if (s->ms) s->ms_stale = 1;
 }
 
 // ---------- quads (blits, fills) ----------
@@ -334,14 +397,14 @@ static void upload_over(DSRRenderer *r, const uint32_t *p, uint32_t size)
 }
 /* the helper pipelines (0 the quad, 1 the "over" quad, 2 the depth/stencil clear) for a colour target of another format
  * than the screen's (the game's floating-point render targets) */
-static id<MTLRenderPipelineState> helper_pso(DSRRenderer *r, int kind, MTLPixelFormat pf)
+static id<MTLRenderPipelineState> helper_pso(DSRRenderer *r, int kind, MTLPixelFormat pf, uint32_t samples)
 {
-    if (pf == MTLPixelFormatBGRA8Unorm) return kind == 0 ? r->quad_pso : kind == 1 ? r->quad_over_pso : r->zclear_pso;
+    if (pf == MTLPixelFormatBGRA8Unorm && samples <= 1) return kind == 0 ? r->quad_pso : kind == 1 ? r->quad_over_pso : r->zclear_pso;
     static uint64_t k_[64]; static __strong id<MTLRenderPipelineState> v_[64]; static int n_;
-    uint64_t key = (uint64_t)pf << 8 | (uint64_t)kind;
+    uint64_t key = (uint64_t)pf << 16 | (uint64_t)samples << 8 | (uint64_t)kind;
     for (int k = 0; k < n_; k++) if (k_[k] == key) return v_[k];
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; NSError *err = nil;
-    d.colorAttachments[0].pixelFormat = pf;
+    d.colorAttachments[0].pixelFormat = pf; d.rasterSampleCount = samples > 1 ? samples : 1;
     if (kind < 2) {
         d.vertexFunction = [r->lib newFunctionWithName:@"vs_quad"]; d.fragmentFunction = [r->lib newFunctionWithName:@"fs_quad"];
         if (kind == 1) { d.colorAttachments[0].blendingEnabled = YES; d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
@@ -364,7 +427,7 @@ static void quad(DSRRenderer *r, uint32_t dst, const int32_t *drect, uint32_t sr
     else if (s) { float sw = s->w, sh = s->h; q.src[0] = srect[0] / sw; q.src[1] = srect[1] / sh; q.src[2] = srect[2] / sw; q.src[3] = srect[3] / sh; }
     q.color[0] = ((color >> 16) & 255) / 255.0f; q.color[1] = ((color >> 8) & 255) / 255.0f; q.color[2] = (color & 255) / 255.0f; q.color[3] = ((color >> 24) & 255) / 255.0f;
     q.mode[0] = fill == 1;
-    id<MTLRenderPipelineState> qp = helper_pso(r, fill == 2 ? 1 : 0, d->tex.pixelFormat); if (!qp) return;
+    id<MTLRenderPipelineState> qp = helper_pso(r, fill == 2 ? 1 : 0, d->tex.pixelFormat, pass_samples(d, NULL)); if (!qp) return;
     id<MTLRenderCommandEncoder> e = enc_for(r, dst, 0); if (!e) return;
     [e setRenderPipelineState:qp]; [e setDepthStencilState:r->nodepth_ds]; [e setCullMode:MTLCullModeNone];
     [e setViewport:(MTLViewport){0, 0, d->w * d->sc, d->h * d->sc, 0, 1}];                   /* texture pixels (a scaled target: larger) */
@@ -401,6 +464,7 @@ static id<MTLRenderPipelineState> pipeline_for(DSRRenderer *r, uint32_t fvf, int
     Surf *ct = surf(r, r->rt); MTLPixelFormat cpf = ct ? ct->tex.pixelFormat : MTLPixelFormatBGRA8Unorm;
     uint64_t key = ((uint64_t)fvf << 32) | (uint64_t)cw << 20 | (blend << 16) | (sb << 8) | (db << 4) | atest << 2 | (uint64_t)has_depth << 1 | 1;   // never 0
     if (cpf != MTLPixelFormatBGRA8Unorm) key ^= (uint64_t)cpf << 25;
+    uint32_t nsamp = cur_samples(r); if (nsamp > 1) key ^= (uint64_t)nsamp << 60;
     if (key == r->pso_k[r->pso_last]) return r->pso_v[r->pso_last];                                         // same as the last draw
     uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 54);
     while (r->pso_k[h] && r->pso_k[h] != key) h = (h + 1) & 1023;
@@ -410,7 +474,7 @@ static id<MTLRenderPipelineState> pipeline_for(DSRRenderer *r, uint32_t fvf, int
     d.vertexFunction = [r->lib newFunctionWithName:@"vs_main"];
     {   MTLFunctionConstantValues *fc = [MTLFunctionConstantValues new]; bool at = atest; [fc setConstantValue:&at type:MTLDataTypeBool atIndex:0];
         d.fragmentFunction = [r->lib newFunctionWithName:@"fs_main" constantValues:fc error:&err]; }
-    d.colorAttachments[0].pixelFormat = cpf;
+    d.colorAttachments[0].pixelFormat = cpf; d.rasterSampleCount = nsamp;
     if (has_depth) d.depthAttachmentPixelFormat = d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     d.colorAttachments[0].writeMask = (cw & 1 ? MTLColorWriteMaskRed : 0) | (cw & 2 ? MTLColorWriteMaskGreen : 0) | (cw & 4 ? MTLColorWriteMaskBlue : 0) | (cw & 8 ? MTLColorWriteMaskAlpha : 0);
     if (blend) { d.colorAttachments[0].blendingEnabled = YES; d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = bf(sb);
@@ -582,13 +646,14 @@ static void prog_create(DSRRenderer *r, const uint32_t *p, uint32_t size)
 static id<MTLRenderPipelineState> prog_pipeline(DSRRenderer *r, uint32_t mask, int has_depth)
 {
     uint32_t blend = r->rs[27] ? 1 : 0, sb = blend ? target_bf(r, r->rs[19]) : 2, db = blend ? target_bf(r, r->rs[20]) : 1, cw = r->rs[168] & 15;
-    uint64_t key = (uint64_t)r->cur_prog << 48 | (uint64_t)mask << 32 | cw << 20 | blend << 16 | sb << 8 | db << 4 | (uint64_t)has_depth << 1 | 1;
+    uint32_t nsamp = cur_samples(r);
+    uint64_t key = (uint64_t)r->cur_prog << 48 | (uint64_t)mask << 32 | (uint64_t)nsamp << 24 | cw << 20 | blend << 16 | sb << 8 | db << 4 | (uint64_t)has_depth << 1 | 1;
     uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 55);
     while (r->ppso_k[h] && r->ppso_k[h] != key) h = (h + 1) & 511;
     if (r->ppso_k[h]) return r->ppso_v[h];
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; NSError *err = nil;
     d.vertexFunction = r->prog[r->cur_prog].vs; d.fragmentFunction = r->prog[r->cur_prog].fs;
-    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm; d.rasterSampleCount = nsamp;
     d.colorAttachments[0].writeMask = (cw & 1 ? MTLColorWriteMaskRed : 0) | (cw & 2 ? MTLColorWriteMaskGreen : 0) | (cw & 4 ? MTLColorWriteMaskBlue : 0) | (cw & 8 ? MTLColorWriteMaskAlpha : 0);
     if (has_depth) d.depthAttachmentPixelFormat = d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     if (blend) { d.colorAttachments[0].blendingEnabled = YES; d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = bf(sb);
@@ -687,7 +752,7 @@ static void clear_rect(DSRRenderer *r, uint32_t flags, uint32_t color, float z, 
 {
     if (flags & 1) quad(r, r->rt, rc, 0, rc, 1, color);                          // D3DCLEAR_TARGET
     if ((flags & 6) && has_ds) {                                                // D3DCLEAR_ZBUFFER, D3DCLEAR_STENCIL
-        Surf *ct = surf(r, r->rt); id<MTLRenderPipelineState> zp = ct ? helper_pso(r, 2, ct->tex.pixelFormat) : nil; if (!zp) return;
+        Surf *ct = surf(r, r->rt); id<MTLRenderPipelineState> zp = ct ? helper_pso(r, 2, ct->tex.pixelFormat, cur_samples(r)) : nil; if (!zp) return;
         id<MTLRenderCommandEncoder> e = enc_for(r, r->rt, r->ds); float zz[4] = {z, 0, 0, 0};
         [e setRenderPipelineState:zp]; [e setDepthStencilState:r->zsclear_ds[(flags >> 1) & 3]]; [e setCullMode:MTLCullModeNone];
         if (flags & 4) [e setStencilReferenceValue:stencil & 255];
@@ -988,7 +1053,8 @@ static id<MTLRenderPipelineState> gpipeline(DSRRenderer *r, GP *g, const GAttr *
     if (src == 12) { src = 5; dst = 6; } if (src == 13) { src = 6; dst = 5; } if (sa == 12) { sa = 5; da = 6; } if (sa == 13) { sa = 6; da = 5; }
     src = target_bf(r, src); dst = target_bf(r, dst); sa = target_bf(r, sa); da = target_bf(r, da);
     MTLPixelFormat cpf = rt->tex.pixelFormat; uint32_t cw = r->rs[168] & 15;
-    uint32_t k[8] = {g->hash, blend, blend ? src | dst << 4 | sa << 8 | da << 12 | op << 16 | opa << 20 : 0, cw, (uint32_t)cpf, ds ? 1 : 0, (uint32_t)na, (uint32_t)nl};
+    uint32_t nsamp = pass_samples(rt, ds);
+    uint32_t k[9] = {g->hash, blend, blend ? src | dst << 4 | sa << 8 | da << 12 | op << 16 | opa << 20 : 0, cw, (uint32_t)cpf, ds ? 1 : 0, (uint32_t)na, (uint32_t)nl, nsamp};
     uint32_t h1 = fnv1a(fnv1a(fnv1a(2166136261u, k, sizeof k), at, sizeof *at * (size_t)na), lay, sizeof *lay * (size_t)nl);
     uint64_t key = ((uint64_t)h1 << 32 | (uint64_t)fnv1a(h1 ^ 0x5bd1e995u, k, sizeof k)) | 1;
     uint32_t h = (uint32_t)(key * 0x9e3779b97f4a7c15ull >> 52);
@@ -996,7 +1062,7 @@ static id<MTLRenderPipelineState> gpipeline(DSRRenderer *r, GP *g, const GAttr *
     if (r->gpso_k[h]) return r->gpso_v[h];
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; NSError *err = nil;
     d.vertexFunction = g->vs; d.fragmentFunction = g->fs;
-    d.colorAttachments[0].pixelFormat = cpf;
+    d.colorAttachments[0].pixelFormat = cpf; d.rasterSampleCount = nsamp;
     d.colorAttachments[0].writeMask = (cw & 1 ? MTLColorWriteMaskRed : 0) | (cw & 2 ? MTLColorWriteMaskGreen : 0) | (cw & 4 ? MTLColorWriteMaskBlue : 0) | (cw & 8 ? MTLColorWriteMaskAlpha : 0);
     if (ds) d.depthAttachmentPixelFormat = d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     if (blend) {
